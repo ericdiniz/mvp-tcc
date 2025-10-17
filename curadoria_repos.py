@@ -10,10 +10,11 @@ apoia a selecao transparente de casos para estudos empiricos replicaveis.
 from __future__ import annotations
 
 import csv
-import json
 import logging
 import os
 import sys
+import time
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,7 +30,17 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger("curadoria")
 
-# Lista inicial de repositorios a serem inspecionados.
+TARGET_SELECTION_COUNT = int(os.environ.get("CURADORIA_TARGET_COUNT", "10"))
+MIN_SCORE_THRESHOLD = int(os.environ.get("CURADORIA_MIN_SCORE", "6"))
+MIN_WORKFLOW_COUNT = int(os.environ.get("CURADORIA_MIN_WORKFLOWS", "30"))
+SEARCH_QUERY = os.environ.get("CURADORIA_SEARCH_QUERY", "stars:>10000 sort:stars-desc")
+SEARCH_PAGE_SIZE = int(os.environ.get("CURADORIA_SEARCH_PAGE_SIZE", "10"))
+MAX_SEARCH_PAGES = int(os.environ.get("CURADORIA_MAX_SEARCH_PAGES", "120"))
+AUTO_DISCOVERY_ENABLED = os.environ.get("CURADORIA_AUTO_DISCOVERY", "true").lower() != "false"
+SEARCH_MAX_RETRIES = int(os.environ.get("CURADORIA_MAX_RETRIES", "3"))
+SEARCH_RETRY_BACKOFF = float(os.environ.get("CURADORIA_RETRY_BACKOFF", "2.0"))
+
+# Lista manual de repositorios para fallback, caso a descoberta automatica nao atinja a meta.
 REPOSITORIES = [
     "facebook/react",
     "axios/axios",
@@ -136,6 +147,15 @@ def run_graphql(token: str, query: str, variables: Dict[str, Any]) -> Dict[str, 
         LOGGER.error("Limite de requisicoes excedido. Reset em %s", reset_at)
         raise RuntimeError("Rate limit excedido para a API GraphQL do GitHub.")
 
+    if 500 <= response.status_code < 600:
+        truncated = response.text[:200].replace("\n", " ") if response.text else ""
+        LOGGER.warning(
+            "Erro temporario na API (HTTP %s): %s",
+            response.status_code,
+            truncated,
+        )
+        raise RuntimeError(f"Erro temporario HTTP {response.status_code}")
+
     if not response.ok:
         LOGGER.error("Erro HTTP %s: %s", response.status_code, response.text)
         response.raise_for_status()
@@ -188,6 +208,44 @@ def compute_adequacy_score(assessment: RepositoryAssessment) -> int:
     return score
 
 
+def build_assessment_from_repository_data(
+    repository: Dict[str, Any],
+    fallback_full_name: str,
+) -> Optional[RepositoryAssessment]:
+    """Transforma o payload GraphQL em RepositoryAssessment."""
+
+    if repository is None:
+        return None
+
+    workflows_tree = repository.get("workflows") or {}
+    workflow_entries = workflows_tree.get("entries") or []
+    workflow_files = [entry.get("name", "") for entry in workflow_entries]
+    has_test_commands = detect_test_commands(workflow_entries)
+
+    has_test_directory = any(
+        repository.get(alias) is not None
+        for alias in ("directoryTests", "directoryTest", "directoryUnderscoreTests")
+    )
+
+    assessment = RepositoryAssessment(
+        full_name=repository.get("nameWithOwner", fallback_full_name),
+        stars=repository.get("stargazerCount", 0),
+        forks=repository.get("forkCount", 0),
+        pushed_at=repository.get("pushedAt", ""),
+        primary_language=(repository.get("primaryLanguage") or {}).get("name"),
+        workflow_count=len(workflow_entries),
+        has_test_commands=has_test_commands,
+        has_test_directory=has_test_directory,
+        bug_issues_open=(repository.get("issuesBugOpen") or {}).get("totalCount", 0),
+        bug_issues_closed=(repository.get("issuesBugClosed") or {}).get("totalCount", 0),
+        adequacy_score=0,
+        workflow_files=workflow_files,
+    )
+
+    assessment.adequacy_score = compute_adequacy_score(assessment)
+    return assessment
+
+
 def prepare_query() -> str:
     """Retorna a query GraphQL utilizada para coletar os dados."""
     return """
@@ -226,6 +284,55 @@ def prepare_query() -> str:
     """
 
 
+def prepare_search_query() -> str:
+        """Retorna a query GraphQL para descoberta automatica via Search API."""
+        return """
+        query($query: String!, $first: Int!, $after: String) {
+            search(query: $query, type: REPOSITORY, first: $first, after: $after) {
+                repositoryCount
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+                edges {
+                    node {
+                        ... on Repository {
+                            nameWithOwner
+                            stargazerCount
+                            forkCount
+                            pushedAt
+                            primaryLanguage { name }
+                            workflows: object(expression: "HEAD:.github/workflows") {
+                                ... on Tree {
+                                    entries {
+                                        name
+                                        type
+                                        object {
+                                            ... on Blob {
+                                                text
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            directoryTests: object(expression: "HEAD:tests") { id }
+                            directoryTest: object(expression: "HEAD:test") { id }
+                            directoryUnderscoreTests: object(expression: "HEAD:__tests__") { id }
+                            issuesBugOpen: issues(labels: ["bug"], states: OPEN) { totalCount }
+                            issuesBugClosed: issues(labels: ["bug"], states: CLOSED) { totalCount }
+                        }
+                    }
+                }
+            }
+            rateLimit {
+                remaining
+                resetAt
+                cost
+            }
+        }
+        """
+
+
 def analyze_repository(token: str, full_name: str, query: str) -> Optional[RepositoryAssessment]:
     """Coleta e calcula os dados para um repositorio especifico."""
     owner, name = full_name.split("/", maxsplit=1)
@@ -252,33 +359,10 @@ def analyze_repository(token: str, full_name: str, query: str) -> Optional[Repos
         LOGGER.error("Repositorio %s nao encontrado ou inacessivel.", full_name)
         return None
 
-    workflows_tree = repository.get("workflows")
-    workflow_entries = workflows_tree.get("entries") if workflows_tree else []
-    workflow_files = [entry.get("name", "") for entry in workflow_entries]
-    workflow_count = len(workflow_entries)
-    has_test_commands = detect_test_commands(workflow_entries)
-
-    has_test_directory = any(
-        repository.get(alias) is not None
-        for alias in ("directoryTests", "directoryTest", "directoryUnderscoreTests")
-    )
-
-    assessment = RepositoryAssessment(
-        full_name=repository.get("nameWithOwner", full_name),
-        stars=repository.get("stargazerCount", 0),
-        forks=repository.get("forkCount", 0),
-        pushed_at=repository.get("pushedAt", ""),
-        primary_language=(repository.get("primaryLanguage") or {}).get("name"),
-        workflow_count=workflow_count,
-        has_test_commands=has_test_commands,
-        has_test_directory=has_test_directory,
-        bug_issues_open=(repository.get("issuesBugOpen") or {}).get("totalCount", 0),
-        bug_issues_closed=(repository.get("issuesBugClosed") or {}).get("totalCount", 0),
-        adequacy_score=0,
-        workflow_files=workflow_files,
-    )
-
-    assessment.adequacy_score = compute_adequacy_score(assessment)
+    assessment = build_assessment_from_repository_data(repository, full_name)
+    if assessment is None:
+        LOGGER.error("Payload inesperado para %s", full_name)
+        return None
     LOGGER.info(
         "Repositorio %s analisado: score=%s, workflows=%s, testes=%s, bugs=%s",
         assessment.full_name,
@@ -288,6 +372,137 @@ def analyze_repository(token: str, full_name: str, query: str) -> Optional[Repos
         assessment.bug_issues_total,
     )
     return assessment
+
+
+def discover_repositories(token: str) -> List[RepositoryAssessment]:
+    """Busca repositorios populares e retorna os que atingirem a pontuacao minima."""
+
+    if not AUTO_DISCOVERY_ENABLED:
+        LOGGER.info("Descoberta automatica desativada por configuracao.")
+        return []
+
+    query = prepare_search_query()
+    after_cursor: Optional[str] = None
+    selected: List[RepositoryAssessment] = []
+    seen: set[str] = set()
+    pages = 0
+
+    per_page = max(1, min(SEARCH_PAGE_SIZE, 100))
+    desired = max(1, TARGET_SELECTION_COUNT)
+
+    LOGGER.info(
+        "Iniciando descoberta automatica: query='%s', alvo=%s, pagina=%s registros",
+        SEARCH_QUERY,
+        desired,
+        per_page,
+    )
+
+    while len(selected) < desired and pages < MAX_SEARCH_PAGES:
+        variables = {"query": SEARCH_QUERY, "first": per_page, "after": after_cursor}
+        payload: Optional[Dict[str, Any]] = None
+        attempt = 0
+        while attempt < SEARCH_MAX_RETRIES:
+            try:
+                payload = run_graphql(token, query, variables)
+                break
+            except RuntimeError as exc:
+                attempt += 1
+                if attempt >= SEARCH_MAX_RETRIES:
+                    LOGGER.error("Erro ao executar busca GraphQL apos %s tentativas: %s", attempt, exc)
+                    break
+                delay = SEARCH_RETRY_BACKOFF * attempt
+                LOGGER.warning("Falha temporaria na busca (%s). Tentando novamente em %.1fs...", exc, delay)
+                time.sleep(delay)
+            except PermissionError as exc:
+                LOGGER.error("Permissao insuficiente na busca: %s", exc)
+                return selected
+
+        if payload is None:
+            LOGGER.warning("Busca interrompida por erros recorrentes.")
+            break
+
+        data = payload.get("data") or {}
+        search_block = data.get("search") or {}
+        edges = search_block.get("edges") or []
+
+        if not edges:
+            LOGGER.info("Sem resultados adicionais na busca (pagina %s).", pages + 1)
+            break
+
+        for edge in edges:
+            repo_node = edge.get("node") or {}
+            if not repo_node:
+                continue
+
+            full_name = repo_node.get("nameWithOwner")
+            if not full_name or full_name in seen:
+                continue
+
+            assessment = build_assessment_from_repository_data(repo_node, full_name or "")
+            if assessment is None:
+                continue
+
+            seen.add(assessment.full_name)
+
+            if not assessment.has_test_commands:
+                LOGGER.debug(
+                    "Ignorando %s: nenhum comando de teste detectado nos workflows.",
+                    assessment.full_name,
+                )
+                continue
+
+            if assessment.workflow_count < MIN_WORKFLOW_COUNT:
+                LOGGER.debug(
+                    "Ignorando %s: apenas %s workflows (minimo exigido: %s).",
+                    assessment.full_name,
+                    assessment.workflow_count,
+                    MIN_WORKFLOW_COUNT,
+                )
+                continue
+
+            if assessment.adequacy_score >= MIN_SCORE_THRESHOLD:
+                selected.append(assessment)
+                LOGGER.info(
+                    "Selecionado %s (score=%s, workflows=%s)",
+                    assessment.full_name,
+                    assessment.adequacy_score,
+                    assessment.workflow_count,
+                )
+                if len(selected) >= desired:
+                    break
+            else:
+                LOGGER.debug(
+                    "Ignorando %s: score %s abaixo do limiar %s.",
+                    assessment.full_name,
+                    assessment.adequacy_score,
+                    MIN_SCORE_THRESHOLD,
+                )
+
+        page_info = search_block.get("pageInfo") or {}
+        if len(selected) >= desired:
+            break
+        if not page_info.get("hasNextPage"):
+            LOGGER.info("Busca alcancou o fim dos resultados (pagina %s).", pages + 1)
+            break
+
+        after_cursor = page_info.get("endCursor")
+        pages += 1
+
+        rate_info = data.get("rateLimit") or {}
+        remaining = rate_info.get("remaining")
+        if remaining is not None and remaining < RATE_LIMIT_BUFFER:
+            LOGGER.warning(
+                "Rate limit baixo (%s requisicoes restantes) apos descoberta. Encerrando ciclo.",
+                remaining,
+            )
+            break
+
+    LOGGER.info(
+        "Descoberta automatica retornou %s repositorios qualificados (paginas percorridas: %s).",
+        len(selected),
+        pages + 1 if pages or selected else 0,
+    )
+    return selected
 
 
 def build_outputs(assessments: List[RepositoryAssessment]) -> None:
@@ -332,7 +547,7 @@ def build_outputs(assessments: List[RepositoryAssessment]) -> None:
             writer.writerows(data_for_export)
         LOGGER.info("Resultados salvos em %s", OUT_CSV)
 
-    finalists = [item for item in ordered if item.adequacy_score >= 6]
+    finalists = [item for item in ordered if item.adequacy_score >= MIN_SCORE_THRESHOLD]
 
     markdown_lines: List[str] = [
     "# Justificativas de Selecao\n",
@@ -383,18 +598,65 @@ def main() -> None:
         LOGGER.critical("Nao foi possivel carregar o token: %s", exc)
         sys.exit(1)
 
-    query = prepare_query()
     assessments: List[RepositoryAssessment] = []
+    selected_names: set[str] = set()
 
-    for full_name in REPOSITORIES:
-        LOGGER.info("Processando %s", full_name)
-        assessment = analyze_repository(token, full_name, query)
-        if assessment:
-            assessments.append(assessment)
+    discovered = discover_repositories(token)
+    assessments.extend(discovered)
+    selected_names.update(item.full_name for item in discovered)
+
+    remaining_slots = max(0, TARGET_SELECTION_COUNT - len(assessments))
+
+    if remaining_slots and REPOSITORIES:
+        LOGGER.info(
+            "Complementando com lista manual para preencher %s repositorios restantes.",
+            remaining_slots,
+        )
+        manual_query = prepare_query()
+        for full_name in REPOSITORIES:
+            if full_name in selected_names:
+                continue
+            LOGGER.info("Processando fallback %s", full_name)
+            assessment = analyze_repository(token, full_name, manual_query)
+            if not assessment:
+                continue
+            if not assessment.has_test_commands:
+                LOGGER.debug(
+                    "Ignorando fallback %s: nenhum comando de teste nos workflows.",
+                    assessment.full_name,
+                )
+                continue
+            if assessment.workflow_count < MIN_WORKFLOW_COUNT:
+                LOGGER.debug(
+                    "Ignorando fallback %s: apenas %s workflows (minimo exigido: %s).",
+                    assessment.full_name,
+                    assessment.workflow_count,
+                    MIN_WORKFLOW_COUNT,
+                )
+                continue
+            if assessment.adequacy_score >= MIN_SCORE_THRESHOLD:
+                assessments.append(assessment)
+                selected_names.add(assessment.full_name)
+            else:
+                LOGGER.debug(
+                    "Ignorando fallback %s: score %s abaixo do limiar %s.",
+                    assessment.full_name,
+                    assessment.adequacy_score,
+                    MIN_SCORE_THRESHOLD,
+                )
+            if len(assessments) >= TARGET_SELECTION_COUNT:
+                break
 
     if not assessments:
-        LOGGER.error("Nenhum repositorio pode ser avaliado. Encerrando.")
+        LOGGER.error("Nenhum repositorio qualificado foi encontrado. Encerrando.")
         sys.exit(1)
+
+    if len(assessments) < TARGET_SELECTION_COUNT:
+        LOGGER.warning(
+            "Somente %s repositorios atingiram a pontuacao minima (meta=%s).",
+            len(assessments),
+            TARGET_SELECTION_COUNT,
+        )
 
     build_outputs(assessments)
 
